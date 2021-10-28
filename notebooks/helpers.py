@@ -17,7 +17,9 @@ import pandas as pd
 import dask.dataframe as dd
 import datetime as dt
 import matplotlib.pyplot as plt
+import multiprocessing as mp
 import requests
+import tarfile
 import tqdm
 import os
 from scipy.io import wavfile
@@ -26,22 +28,27 @@ from zipfile import ZipFile
 plt.ion()
 
 
+BASE_URL = "https://spiddal.marine.ie/data/hydrophones"
+BASE_PATH = os.path.expanduser("~/Workspace/data/smartbay/hydrophone")
+CACHE_DIRECTORY = os.path.expanduser("~/Workspace/data/cache")
+
+
 class SmartBayHydrophone(object):
 
     def __init__(self, date, hydrophone="SBF1622"):
         """Class constructor"""
         self.date = date
         self.hydrophone = hydrophone
-        self._cache_directory = os.path.expanduser("~/Workspace/data/cache")
+        self._cache_directory = CACHE_DIRECTORY
         
 
     def get_filenames(self):
         """Return list of available file names for the diven day"""
 
-        base_url = "https://spiddal.marine.ie/data/hydrophones"
+        base_url = BASE_URL
         zip_url = (
             f"{base_url}/{self.hydrophone}/{self.date:%Y/%m/%d}/"
-            f"{self.hydrophone}_{date:%Y%m%d}.zip"
+            f"{self.hydrophone}_{self.date:%Y%m%d}.zip"
         )
         content = requests.get(zip_url)
         zf = ZipFile(BytesIO(content.content))
@@ -50,6 +57,24 @@ class SmartBayHydrophone(object):
             f"{base_url}/{self.hydrophone}/{self.date:%Y/%m/%d}/{item}"
             for item in zf.namelist() if item.endswith(".txt")
         ]
+
+    def read_local_file(self):
+        """Return class for a givel local filename"""
+        
+        # get file names
+        base_path = BASE_PATH
+        fname = f"{base_path}/{self.hydrophone}_{self.date:%Y%m%d}.tgz"
+        with tarfile.open(fname, "r:*") as tar:
+            fnames = tar.getnames()
+            self.data = xr.concat(
+                [
+                    self.read_csv(tar.extractfile(fname)) 
+                    for fname in tqdm.tqdm(fnames)
+                ],
+                dim="time"
+            )
+
+        return self.data
 
 
     def read_csv(self, fname):
@@ -81,7 +106,7 @@ class SmartBayHydrophone(object):
 
 
     def download(self):
-        """Download one-lenght day of hydrophone data"""
+        """Download one day of hydrophone data"""
 
         # check cache
         ncname = f"_{self.hydrophone}_{self.date:%Y%m%d.nc}"
@@ -102,15 +127,24 @@ class SmartBayHydrophone(object):
         return self.data
 
     
-    def plot_spectrogram(self, vmin=10, vmax=30, cmap="magma"):
+    def plot_spectrogram(
+            self, zoom=None, vmin=10, vmax=30, cmap="magma", **kwargs
+        ):
         """Plot spectrogram"""
-        if hasattr(self, "data"):
-            fig, ax = plt.subplots(figsize=(7,4))
-            self.data.plot(x="time", vmin=vmin, vmax=vmax, cmap=cmap)
-            ax.set_ylabel("Frequency [Hz]")
 
+        fig, ax = plt.subplots(figsize=(7,4))
+        if zoom is None:
+            self.data.plot(
+                x="time", vmin=vmin, vmax=vmax, cmap=cmap,
+                cbar_kwargs={'label': "dB ref 1V -120"}, **kwargs
+            )
         else:
-            print("No data available: run download first")
+            self.data.sel(time=zoom).plot(
+                x="time", vmin=vmin, vmax=vmax, cmap=cmap,
+                cbar_kwargs={'label': "dB ref 1V -120"}, **kwargs
+            )
+        ax.set_ylabel("Frequency [Hz]")
+        return fig, ax
 
 
     def sound_wave(self, sampling_rate=512000):
@@ -131,46 +165,47 @@ class SmartBayHydrophone(object):
         wavfile.write("test.wav", int(sampling_rate/1000), sound_wave)
 
 
-class SoundFile(object):
-    """Handle wav files"""
 
-    def __init__(self, fname):
-        """Class constructor"""
-        self.fname = fname
-        self._read()
-
-    def _read(self):
-        """Read sound wave file"""
-        self.sampling_rate, self.data = wavfile.read(self.fname)
-        if self.data.ndim > 1:
-            self.data = self.data[:,0]
-
-    def plot_spectrogram(self, vmin=-4, vmax=4, cmap="magma", nperseg=256):
-        """Plot spectrogram"""
-
-        if hasattr(self, "data"):
-            self.frqs, self.time, self.power = signal.spectrogram(
-                self.data, fs=self.sampling_rate, nperseg=nperseg
+def smartbay_hourly_average(date):
+    """Return an hourly dataset containing spectrograms"""
+    try:
+        outname = f"{BASE_PATH}/hourly/{date:%Y%m%d}.nc"
+        if not os.path.exists(outname):
+            return (
+                SmartBayHydrophone(date, "SBF1622")
+                .read_local_file()
+                .resample(time="1H")
+                .mean("time")
+                .to_netcdf(outname)
             )
-            fig, ax = plt.subplots(figsize=(7,4))
-            ax.pcolormesh(
-                self.time, self.frqs, np.log10(self.power),
-                vmin=vmin, vmax=vmax, cmap=cmap
-            )
-            ax.set_ylabel("Frequency [Hz]")
+    except Exception as e:
+        print(e)
 
-        else:
-            print("No data available")
+def paralell_smartbay_hourly():
+    """Try to paralellize"""
+    
+    t_beg = dt.date(2019,10,1)
+    t_end = dt.date(2020,8,12)
+    numdays = (t_end - t_beg).days + 1
+    dates = [t_beg + dt.timedelta(days=n) for n in range(numdays)]
+
+    pool = mp.Pool(mp.cpu_count())
+    results = pool.map(smartbay_hourly_average, dates)
+    
+    pool.close()
+        
+
 
 
 if __name__ == "__main__":
+    paralell_smartbay_hourly()
     
     # Available: SBF1622 or SBF1323
-    date = dt.date(2020, 8, 12)
+    # date = dt.date(2020, 8, 12)
     # date = dt.date(2021, 10, 1)
-    self = SmartBayHydrophone(date, "SBF1622")
-    self.download()
-    self.plot_spectrogram()
+    # self = SmartBayHydrophone(date, "SBF1622")
+    # self.download()
+    # self.plot_spectrogram()
 
 
 # -eof
